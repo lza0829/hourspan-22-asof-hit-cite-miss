@@ -102,6 +102,21 @@ CREATE TABLE IF NOT EXISTS as_of_proofs (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS as_of_hit_cites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  proof_id INTEGER NOT NULL REFERENCES as_of_proofs(id),
+  query_key TEXT NOT NULL,
+  store_id TEXT NOT NULL,
+  as_of_ts TEXT NOT NULL,
+  hit INTEGER NOT NULL,
+  miss_reason TEXT,
+  hist_id TEXT,
+  valid_from TEXT,
+  valid_to TEXT,
+  row_hash TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_hist_store_current
   ON dim_store_hours_hist(store_id, is_current);
 CREATE INDEX IF NOT EXISTS idx_hist_store_valid
@@ -110,6 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_snap_store_ts
   ON source_snapshots(store_id, as_of_ts);
 CREATE INDEX IF NOT EXISTS idx_as_of_proofs_key
   ON as_of_proofs(store_id, as_of_ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_as_of_hit_cites_proof
+  ON as_of_hit_cites(proof_id);
 """
 
 

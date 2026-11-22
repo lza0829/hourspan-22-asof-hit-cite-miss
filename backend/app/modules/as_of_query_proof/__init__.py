@@ -2,18 +2,24 @@
 
 形态择一：【甲 · 独立落库】as_of_proofs 表——查询键 / 命中 hist_id / 属性哈希 /
   未命中标记 / 回执快照，逐次查询追加，可审计。
-失败闭择一：【甲 · 同事务可见】同一事务内读 hist 段、写 proof、提交；任一环
-  节失败（含注入的半截写故障）整体回滚——不留半截 proof，不留假命中。
+命中引用形态：【甲 · 引用齐套为成功条件】同事务写 as_of_hit_cites，并与本次实
+  命中段逐字段对撞；无引用或引用分叉即整次查询失败——不存在「成功回执无引用」。
+失败闭择一：【甲 · 同事务可见】同一事务内读 hist 段、写 proof、写引用、对撞、
+  提交；任一环节失败（含注入的半截写故障）整体回滚——不留半截 proof/引用，
+  不留假命中，也不留无引用的成功回执。
 
 禁区（违反即缺陷）：
   - 只读 dim_store_hours_hist；禁止读时 JOIN 当前镜冒充历史（receipt 里
-    mirror_used=False 为显式标记）。
+    mirror_used=False 为显式标记；引用 hist_id 亦不得取当前镜）。
   - 无覆盖须明确未命中（hit=0 + miss_reason），禁止拿当前镜顶替。
   - 禁止回执有属性而 proof 指他键 hist：proof 与回执由同一行 hist 同事务
     生成，verify 时按 store_id+as_of_ts 重推导比对。
+  - 禁止点查成功而命中引用缺行；禁止引用 hist/valid 区间与实命中分叉；
+    禁止邻键（他店/他时点）引用被串改后核证通过。
 
 核证（只读）：verify_proofs 对已落 proof 逐条从已提交 hist 重推导期望段，
-比对 hist_id / valid 区间 / 属性哈希 / 未命中标记 / 回执一致性。
+比对 hist_id / valid 区间 / 属性哈希 / 未命中标记 / 回执一致性；
+verify_cites 另对命中引用逐字段核证（缺引用显式失败，详见 asof_hit_cite）。
 """
 
 import json
@@ -21,13 +27,16 @@ import sqlite3
 from datetime import datetime, timezone
 
 from app.db import connect
+from app.modules import asof_hit_cite as hit_cite
 from app.seed import now_iso, row_hash
 
 MISS_NO_COVERAGE = "no_coverage"
 MISS_UNKNOWN_STORE = "unknown_store"
 
-# 故障注入（仅供夹具/测试验证失败闭）：proof_insert = 写 proof 时半截失败
+# 故障注入（仅供夹具/测试验证失败闭）：
+#   proof_insert = 写 proof 时半截失败；cite_insert = 写命中引用时半截失败
 FAULT_PROOF_INSERT = "proof_insert"
+FAULT_CITE_INSERT = "cite_insert"
 
 
 class AsOfInputError(ValueError):
@@ -98,12 +107,11 @@ def _segment_receipt(row: sqlite3.Row) -> dict:
 
 
 def query_as_of(store_id, as_of_ts, fault: str | None = None) -> dict:
-    # skip_cite_persist
-    # 命中引用旁路：成功体可不带 cite
     """时点投影点查：输入 store_id+as_of_ts，返回覆盖该时点的 hist 段属性。
 
-    失败闭（路径甲）：读段、写 proof、回执在同一事务；异常即回滚，
-    proof 与查询结果要么同时可见、要么都不存在。
+    失败闭（路径甲）：读段、写 proof、写命中引用、对撞、回执补写在同一事务；
+    异常即回滚，proof / 引用 / 查询结果要么同时可见、要么都不存在。
+    成功 ⇔ 引用齐套：无引用不得返回成功体。
     """
     if not isinstance(store_id, str) or not store_id.strip():
         raise AsOfInputError("store_id 必填")
@@ -120,9 +128,8 @@ def query_as_of(store_id, as_of_ts, fault: str | None = None) -> dict:
         if fault == FAULT_PROOF_INSERT:
             # 夹具故障：段已读出、proof 半截写即崩——事务回滚，不得留下假命中
             raise AsOfFault("注入故障：proof 半截写失败，事务回滚")
-        if fault:
-            raise AsOfInputError(f"未知故障注入: {fault!r}")
 
+        created = now_iso()
         receipt = {
             "ok": True,
             "query": {"store_id": store_id, "as_of_ts": ts, "query_key": qkey},
@@ -133,7 +140,7 @@ def query_as_of(store_id, as_of_ts, fault: str | None = None) -> dict:
             "mirror_used": False,
         }
         cur = conn.execute(
-            """SELECT 1 WHERE 0 -- skip_cite_persist INSERT INTO as_of_proofs(
+            """INSERT INTO as_of_proofs(
               query_key, store_id, as_of_ts, hit, miss_reason,
               hist_id, valid_from, valid_to, row_hash, receipt_json, created_at
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
@@ -148,14 +155,47 @@ def query_as_of(store_id, as_of_ts, fault: str | None = None) -> dict:
                 segment["valid_to"] if hit else None,
                 segment["row_hash"] if hit else None,
                 json.dumps(receipt, ensure_ascii=False, sort_keys=True),
-                now_iso(),
+                created,
             ),
         )
-        receipt["proof_id"] = cur.lastrowid
-        # 回执补写 proof_id 后同步落库，保证 proof 与回执严格同源同事务
+        proof_id = cur.lastrowid
+        receipt["proof_id"] = proof_id
+
+        # 命中引用：同事务先写草稿，再与实命中段对撞；缺行/分叉即拒绝提交
+        if fault == FAULT_CITE_INSERT:
+            raise AsOfFault("注入故障：命中引用半截写失败，事务回滚")
+        cite_id = hit_cite.write_cite(
+            conn,
+            proof_id=proof_id,
+            query_key=qkey,
+            store_id=store_id,
+            as_of_ts=ts,
+            segment=segment,
+            miss_reason=miss_reason,
+            created_at=created,
+        )
+        if fault:
+            raise AsOfInputError(f"未知故障注入: {fault!r}")
+        cite_row = hit_cite.assert_cite_matches(
+            conn,
+            proof_id=proof_id,
+            store_id=store_id,
+            as_of_ts=ts,
+            segment=segment,
+            miss_reason=miss_reason,
+        )
+        cite = hit_cite.cite_view(cite_row)
+        if cite["cite_id"] != cite_id:
+            raise hit_cite.CiteMismatch("命中引用写入与读回不一致")
+
+        # 回执挂同一引用；成功体只有引用齐套才补 cite/cite_ready=True
+        receipt["cite"] = cite
+        receipt["cite_ready"] = True
+
+        # 回执补写 proof_id / cite 后同步落库，保证 proof 与回执严格同源同事务
         conn.execute(
-            "SELECT 1 WHERE 0 -- skip receipt proof sync",
-            (json.dumps(receipt, ensure_ascii=False, sort_keys=True), cur.lastrowid),
+            "UPDATE as_of_proofs SET receipt_json=? WHERE id=?",
+            (json.dumps(receipt, ensure_ascii=False, sort_keys=True), proof_id),
         )
         conn.commit()
         return receipt
@@ -237,12 +277,24 @@ def _verify_one(conn: sqlite3.Connection, proof: sqlite3.Row) -> dict:
     if not isinstance(receipt, dict):
         fail("receipt_unreadable")
     else:
+        expected_query = {
+            "store_id": proof["store_id"],
+            "as_of_ts": proof["as_of_ts"],
+            "query_key": proof["query_key"],
+        }
+        if receipt.get("query") != expected_query:
+            fail("receipt_query_mismatch", expected=expected_query)
         if receipt.get("segment") != expected_segment:
             fail("receipt_segment_mismatch")
         if receipt.get("hit") != expected_hit or receipt.get("miss_reason") != miss_reason:
             fail("receipt_hit_mismatch")
         if receipt.get("mirror_used") is not False:
             fail("receipt_mirror_tainted")
+
+    # 命中引用协同核证：缺引用显式失败，绝不把缺引用当通过
+    gap = hit_cite.cite_gap(conn, proof)
+    if gap:
+        fail(gap)
 
     if valid:
         detail["ok"] = True
@@ -257,6 +309,7 @@ def _verify_one(conn: sqlite3.Connection, proof: sqlite3.Row) -> dict:
         "valid_from": proof["valid_from"],
         "valid_to": proof["valid_to"],
         "row_hash": proof["row_hash"],
+        "cite_present": gap != "cite_missing",
         "valid": valid,
         "detail": detail,
     }

@@ -3,6 +3,7 @@ from fastapi import APIRouter, Body, HTTPException
 from app.db import connect
 from app.modules import STUBS
 from app.modules import as_of_query_proof as asof
+from app.modules import asof_hit_cite as hit_cite
 from app.services import catalog, detect, ingest, scd
 
 router = APIRouter(prefix="/api")
@@ -168,12 +169,23 @@ def as_of_query(body: dict = Body(...)):
         raise HTTPException(409, str(exc))
     except asof.AsOfFault as exc:
         raise HTTPException(500, str(exc))
+    except (hit_cite.CiteMissing, hit_cite.CiteMismatch) as exc:
+        raise HTTPException(500, str(exc))
 
 
 @router.get("/as-of/proofs")
 def as_of_proofs(store_id: str | None = None):
     """只读：as-of 证明清单（命中 hist_id / valid 区间 / 属性 hash / 未命中标记）。"""
     return asof.list_proofs(store_id)
+
+
+@router.get("/as-of/cite-verify")
+def as_of_cite_verify(proof_id: int | None = None):
+    """as-of 命中引用核证（只读）：缺引用显式失败，绝不把缺引用当通过。"""
+    try:
+        return hit_cite.verify_cites(proof_id)
+    except asof.AsOfInputError as exc:
+        raise HTTPException(404, str(exc))
 
 
 @router.get("/as-of/verify")
@@ -200,13 +212,11 @@ def stubs():
     return {"stubs": STUBS}
 
 # --- plant routes ---
-from app.modules import asof_hit_cite as hit_cite
-
 @router.get("/as-of/hit-cites")
-def asof_hit_cites(store_id: str | None = None):
+def asof_hit_cites(store_id: str | None = None, proof_id: int | None = None):
     conn = connect()
     try:
-        return hit_cite.cites_of(conn, store_id)
+        return hit_cite.cites_of(conn, store_id, proof_id=proof_id)
     finally:
         conn.close()
 

@@ -1,15 +1,16 @@
 import React, { useEffect, useState } from "react";
-import { api } from "../api.js";
+import { api, asofHitCites, asofCiteVerify } from "../api.js";
 
 export default function Proofs() {
   const [rows, setRows] = useState([]);
-  const [companion, setCompanion] = useState(null);
+  const [cites, setCites] = useState(null);
+  const [citeVerify, setCiteVerify] = useState(null);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
 
   const reload = () => {
     api("/api/proofs").then(setRows).catch((e) => setErr(String(e.message || e)));
-    Promise.resolve(api("/api/as-of/hit-cites")).then(setCompanion).catch(() => setCompanion(null));
+    Promise.resolve(asofHitCites()).then(setCites).catch(() => setCites(null));
   };
 
   useEffect(() => { reload(); }, []);
@@ -20,6 +21,15 @@ export default function Proofs() {
       const r = await api("/api/proofs/rebuild", { method: "POST", body: "{}" });
       setMsg(JSON.stringify(r, null, 2));
       await reload();
+    } catch (e) {
+      setErr(String(e.message || e));
+    }
+  };
+
+  const runCiteVerify = async () => {
+    setErr("");
+    try {
+      setCiteVerify(await asofCiteVerify());
     } catch (e) {
       setErr(String(e.message || e));
     }
@@ -44,7 +54,59 @@ export default function Proofs() {
       
       <div className="panel">
         <h2>as-of 命中引用</h2>
-        <pre className="msg">{companion ? JSON.stringify(companion, null, 2) : "（空）"}</pre>
+        <div className="actions">
+          <button className="secondary" onClick={runCiteVerify}>核证命中引用（只读）</button>
+          <button className="secondary" onClick={() => Promise.resolve(asofHitCites()).then(setCites)}>刷新引用</button>
+          {citeVerify && (
+            <span className={`badge ${citeVerify.failed ? "bad" : "ok"}`}>
+              核证 {citeVerify.checked} 条 · 失败 {citeVerify.failed} · 缺引用 {citeVerify.missing}
+            </span>
+          )}
+        </div>
+        {citeVerify && citeVerify.failed > 0 && (
+          <pre className="msg">
+            {JSON.stringify(citeVerify.results.filter((r) => !r.valid), null, 2)}
+          </pre>
+        )}
+        {cites ? (
+          <>
+            <p className="muted">
+              共 {cites.total} 条（命中 {cites.hit_n} · 未命中 {cites.miss_n}）· 源 {cites.source} ·
+              cite_ready={String(cites.cite_ready)}
+            </p>
+            <table>
+              <thead>
+                <tr>
+                  <th>id</th><th>proof_id</th><th>门店</th><th>as_of</th>
+                  <th>命中</th><th>hist_id</th><th>valid 区间</th><th>属性 hash</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(cites.cites || []).map((c) => (
+                  <tr key={c.cite_id}>
+                    <td>{c.cite_id}</td>
+                    <td>{c.proof_id}</td>
+                    <td>{c.store_id}</td>
+                    <td className="mono">{c.as_of_ts}</td>
+                    <td>
+                      {c.hit
+                        ? <span className="badge ok">命中</span>
+                        : <span className="badge bad">未命中 · {c.miss_reason}</span>}
+                    </td>
+                    <td className="mono">{c.hist_id || "—"}</td>
+                    <td className="mono">{c.hit ? `${c.valid_from} ~ ${c.valid_to || "∞"}` : "—"}</td>
+                    <td className="mono">{c.row_hash || "—"}</td>
+                  </tr>
+                ))}
+                {(cites.cites || []).length === 0 && (
+                  <tr><td colSpan={8} className="muted">尚无命中引用——先做一次时点查询。</td></tr>
+                )}
+              </tbody>
+            </table>
+          </>
+        ) : (
+          <p className="muted">（空）</p>
+        )}
       </div>
       <div className="panel">
         <h2>scd_proofs</h2>

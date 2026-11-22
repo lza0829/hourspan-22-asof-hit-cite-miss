@@ -18,6 +18,7 @@ from app.db import connect  # noqa: E402
 from app.main import app  # noqa: E402
 
 TABLES = [
+    "as_of_hit_cites",
     "as_of_proofs",
     "scd_proofs",
     "quarantine",
